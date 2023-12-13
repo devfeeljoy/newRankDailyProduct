@@ -72,6 +72,7 @@ func convertAndUploadToMongoDB(filePath string, mongoClient *mongo.Client, datab
 	collection := mongoClient.Database(databaseName).Collection(collectionName)
 
 	var documents []interface{}
+	var currentBatchSize int
 	// Avro 레코드를 읽고 MongoDB에 저장
 	for fr.Scan() {
 		// 현재 레코드 읽기
@@ -94,17 +95,26 @@ func convertAndUploadToMongoDB(filePath string, mongoClient *mongo.Client, datab
 				}
 			}
 		}
-		// MongoDB 문서로 변환
-		documents = append(documents, record)
+
+		// BSON으로 문서 변환 후 크기 추정
+		bsonData, err := bson.Marshal(record)
+		if err != nil {
+			return err
+		}
+		bsonSize := len(bsonData)
 
 		// 일정 크기에 도달하면 배치 삽입 실행
-		if len(documents) >= 1000 {
+		if currentBatchSize+bsonSize > 15*1024*1024 {
 			_, err = collection.InsertMany(context.Background(), documents)
 			if err != nil {
 				return err
 			}
 			documents = []interface{}{} // 슬라이스 초기화
+			currentBatchSize = 0
 		}
+		// MongoDB 문서로 변환
+		documents = append(documents, record)
+		currentBatchSize += bsonSize
 	}
 
 	// 남은 문서 처리
