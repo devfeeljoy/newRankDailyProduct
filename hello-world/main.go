@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/aws/aws-lambda-go/events"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"io"
 	"net/http"
 	"net/url"
@@ -20,79 +20,6 @@ import (
 
 	"github.com/linkedin/goavro/v2"
 )
-
-const avroSchema = `{
- "type" : "record",
- "name" : "BuridgeAccountInfoAvro",
- "namespace" : "cn.newrank.api.dy.custom.project.system.biz.buridge.model.avro",
- "fields" : [ {
-   "name" : "uid",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "account",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "nickname",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "introduction",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "avatar",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "gender",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "mcnName",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "enterpriseVerify",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "customVerify",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "dyFansNum",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "fansNum",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "likeNum",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "opusNum",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "homeUrl",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "newrankWeekIndex",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "age",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "mainCategory",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "ipLocation",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "location",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "firstCategory",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "secondCategory",
-   "type" : [ "string", "null" ]
- }, {
-   "name" : "updateTime",
-   "type" : [ "string", "null" ]
- } ]
-}`
 
 // API 응답 구조체
 type ApiResponse struct {
@@ -127,13 +54,7 @@ func downloadAvroFile(url string, filePath string) error {
 	return err
 }
 
-func convertAndUploadToDynamoDB(filePath string) error {
-	//Avro 코덱 생성
-	codec, err := goavro.NewCodec(avroSchema)
-	if err != nil {
-		return err
-	}
-
+func convertAndUploadToMongoDB(filePath string, mongoClient *mongo.Client, databaseName string, collectionName string) error {
 	// 파일 열기
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -147,14 +68,11 @@ func convertAndUploadToDynamoDB(filePath string) error {
 		return err
 	}
 
-	//DynamoDB 세션 및 클라이언트 초기화
-	sess := session.Must(session.NewSessionWithOptions(session.Options{
-		SharedConfigState: session.SharedConfigEnable,
-	}))
-	dynamoDB := dynamodb.New(sess)
+	// MongoDB 컬렉션 선택
+	collection := mongoClient.Database(databaseName).Collection(collectionName)
 
-	var writeRequests []*dynamodb.WriteRequest
-	// Avro 레코드를 읽고 DynamoDB에 저장
+	var documents []interface{}
+	// Avro 레코드를 읽고 MongoDB에 저장
 	for fr.Scan() {
 		// 현재 레코드 읽기
 		raw, err := fr.Read()
@@ -162,25 +80,13 @@ func convertAndUploadToDynamoDB(filePath string) error {
 			return err
 		}
 
-		// Raw 데이터를 바이너리로 변환
-		binary, err := codec.BinaryFromNative(nil, raw)
-		if err != nil {
-			return err
-		}
-
-		// Binary 데이터를 네이티브 Go 타입으로 역직렬화
-		native, _, err := codec.NativeFromBinary(binary)
-		if err != nil {
-			return err
-		}
-
-		// 필요한 데이터 변환 수행
-		record, ok := native.(map[string]interface{})
+		// 필요한 데이터만 추출 (raw는 이미 map[string]interface{} 타입으로 역직렬화된 것으로 가정)
+		record, ok := raw.(map[string]interface{})
 		if !ok {
 			return fmt.Errorf("record is not a map")
 		}
 
-		// 예를 들어, 'string' 타입의 필드를 처리
+		// 필요한 데이터 변환 수행
 		for key, value := range record {
 			if valueMap, ok := value.(map[string]interface{}); ok {
 				if stringValue, ok := valueMap["string"].(string); ok {
@@ -188,27 +94,22 @@ func convertAndUploadToDynamoDB(filePath string) error {
 				}
 			}
 		}
+		// MongoDB 문서로 변환
+		documents = append(documents, record)
 
-		//DynamoDB 항목 매핑
-		item, err := dynamodbattribute.MarshalMap(record)
-		if err != nil {
-			return err
-		}
-
-		writeRequest := &dynamodb.WriteRequest{PutRequest: &dynamodb.PutRequest{Item: item}}
-		writeRequests = append(writeRequests, writeRequest)
-
-		if len(writeRequests) >= 25 {
-			err = batchWriteToDynamoDB(dynamoDB, "Influencer", writeRequests)
+		// 일정 크기에 도달하면 배치 삽입 실행
+		if len(documents) >= 1000 {
+			_, err = collection.InsertMany(context.Background(), documents)
 			if err != nil {
 				return err
 			}
-			writeRequests = writeRequests[:0] // 슬라이스 초기화
+			documents = []interface{}{} // 슬라이스 초기화
 		}
 	}
-	// 마지막 배치 처리
-	if len(writeRequests) > 0 {
-		err = batchWriteToDynamoDB(dynamoDB, "Influencer", writeRequests)
+
+	// 남은 문서 처리
+	if len(documents) > 0 {
+		_, err = collection.InsertMany(context.Background(), documents)
 		if err != nil {
 			return err
 		}
@@ -216,19 +117,27 @@ func convertAndUploadToDynamoDB(filePath string) error {
 	return nil
 }
 
-func batchWriteToDynamoDB(dynamoDB *dynamodb.DynamoDB, tableName string, writeRequests []*dynamodb.WriteRequest) error {
-	batchInput := &dynamodb.BatchWriteItemInput{
-		RequestItems: map[string][]*dynamodb.WriteRequest{
-			tableName: writeRequests,
-		},
-	}
-
-	_, err := dynamoDB.BatchWriteItem(batchInput)
-	return err
-}
-
 // Lambda 핸들러 함수
 func HandleRequest(ctx context.Context) (events.APIGatewayProxyResponse, error) {
+	//mongoDB 연결
+	serverAPI := options.ServerAPI(options.ServerAPIVersion1)
+	opts := options.Client().ApplyURI("mongodb+srv://sparta:p8hDJNs18HANQ7eU@cluster0.5pjmefm.mongodb.net/?retryWrites=true&w=majority").SetServerAPIOptions(serverAPI)
+	// Create a new client and connect to the server
+	clientMongo, err := mongo.Connect(context.TODO(), opts)
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		if err = clientMongo.Disconnect(context.TODO()); err != nil {
+			panic(err)
+		}
+	}()
+	// Send a ping to confirm a successful connection
+	if err := clientMongo.Database("admin").RunCommand(context.TODO(), bson.D{{"ping", 1}}).Err(); err != nil {
+		panic(err)
+	}
+	fmt.Println("Pinged your deployment. You successfully connected to MongoDB!")
+
 	apiKey := os.Getenv("key") // 환경 변수에서 API 키 가져오기
 	if apiKey == "" {
 		fmt.Println("API key is not set in environment variables.")
@@ -239,7 +148,7 @@ func HandleRequest(ctx context.Context) (events.APIGatewayProxyResponse, error) 
 	}
 
 	// 전날 날짜 계산
-	yesterday := time.Now().AddDate(0, 0, -2).Format("2006-01-02")
+	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
 
 	apiUrl, err := url.Parse("https://api.newrank.cn/api/v2/custom/common/buridge/file/list")
 	if err != nil {
@@ -305,7 +214,7 @@ func HandleRequest(ctx context.Context) (events.APIGatewayProxyResponse, error) 
 			StatusCode: 500,
 		}, nil
 	}
-	err = convertAndUploadToDynamoDB(filePath)
+	err = convertAndUploadToMongoDB(filePath, clientMongo, "NewRank", "Influencer")
 
 	if err != nil {
 		return events.APIGatewayProxyResponse{
@@ -321,5 +230,6 @@ func HandleRequest(ctx context.Context) (events.APIGatewayProxyResponse, error) 
 }
 
 func main() {
+
 	lambda.Start(HandleRequest)
 }
